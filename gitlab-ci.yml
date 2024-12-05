@@ -1,0 +1,123 @@
+stages:
+  - scan
+
+analyze-and-update-all:
+  stage: scan
+  variables:
+    TEMP_DIR: "temp-repos"
+    GITLAB_API_URL: "https://gitlab.com/api/v4"
+    GROUP_ID: $YOUR_GROUP_ID
+    DotnetOutdatedReportDir: "${CI_PROJECT_DIR}/DotnetOutdatedReports"
+  script:
+    - echo "Criando diretório para relatórios Dotnet Outdated em $DotnetOutdatedReportDir"
+    - |
+      if (Test-Path "$env:DotnetOutdatedReportDir") { Remove-Item -Recurse -Force "$env:DotnetOutdatedReportDir" }
+      New-Item -ItemType Directory -Path "$env:DotnetOutdatedReportDir" | Out-Null
+    - echo "Iniciando análise de repositórios do grupo $GROUP_ID"
+    - |
+      $Headers = @{ 'PRIVATE-TOKEN' = $env:GITLAB_TOKEN }
+      $Projects = Invoke-RestMethod -Uri "$env:GITLAB_API_URL/groups/$env:GROUP_ID/projects" -Headers $Headers
+      foreach ($Project in $Projects) {
+          $RepoName = $Project.name
+          $ProjectId = $Project.id
+          $CloneUrl = $Project.http_url_to_repo -replace "https://", "https://oauth2:$env:GITLAB_TOKEN@"
+          Write-Host "Clonando repositório: $RepoName"
+          git clone $CloneUrl "$env:TEMP_DIR/$RepoName"
+          Set-Location "$env:TEMP_DIR/$RepoName"
+          dotnet restore
+          Write-Host "Executando dotnet outdated para verificar dependências..."
+          $DotnetOutdatedFile = "$env:DotnetOutdatedReportDir/dotnet-outdated-tool_${ProjectId}.json"
+          dotnet outdated --version-lock Major --output-format json --output $DotnetOutdatedFile
+          if (Test-Path $DotnetOutdatedFile) {
+              Write-Host "Arquivo $DotnetOutdatedFile gerado com sucesso."
+              $jsonContent = Get-Content $DotnetOutdatedFile | ConvertFrom-Json
+              $Updated = $false
+              foreach ($project in $jsonContent.Projects) {
+                  $csprojFilePath = $project.FilePath
+                  Write-Host "Atualizando dependências no arquivo $csprojFilePath"
+
+                  # Carregar o arquivo .csproj como XML
+                  [xml]$csprojXml = Get-Content -Path $csprojFilePath
+
+                  foreach ($targetFramework in $project.TargetFrameworks) {
+                      foreach ($dependency in $targetFramework.Dependencies) {
+                          $packageName = $dependency.Name
+                          $resolvedVersion = $dependency.ResolvedVersion
+                          $latestVersion = $dependency.LatestVersion
+
+                          # Encontrar a referência de pacote no .csproj com a versão resolvida
+                          $packageReference = $csprojXml.Project.ItemGroup.PackageReference |
+                                               Where-Object { $_.Include -eq $packageName -and $_.Version -eq $resolvedVersion }
+
+                          if ($packageReference) {
+                              Write-Host "Atualizando $packageName de $resolvedVersion para $latestVersion"
+
+                              # Atualiza a versão no atributo XML
+                              $packageReference.Version = $latestVersion
+
+                              $Updated = $true
+                          } else {
+                              Write-Host "Nenhuma referência encontrada para o pacote $packageName com versão $resolvedVersion"
+                          }
+                      }
+                  }
+
+                  # Salvar as alterações no arquivo .csproj
+                  if ($Updated) {
+                      $csprojXml.Save($csprojFilePath)
+                      Write-Host "Arquivo $csprojFilePath atualizado com sucesso."
+                  }
+              }
+              if ($Updated) {
+                  $BranchName = "update-dependencies/$CI_JOB_ID"
+                  git checkout -b $BranchName
+                  git add .
+                  git commit -m "pdate dependencies to fix vulnerabilities"
+                  git push origin $BranchName
+                  
+                  # Obter o branch padrão do repositório
+                  $TargetBranchUri = "$env:GITLAB_API_URL/projects/$ProjectId"
+                  $TargetBranchResponse = Invoke-RestMethod -Uri $TargetBranchUri -Headers $Headers
+                  $TargetBranch = $TargetBranchResponse.default_branch
+
+                  # Verificar se já existe um MR com o mesmo branch de origem
+                  $MergeRequestsUri = "$env:GITLAB_API_URL/projects/$ProjectId/merge_requests?state=opened"
+                  $MergeRequestsResponse = Invoke-RestMethod -Uri $MergeRequestsUri -Headers $Headers
+                  $ExistingMR = $MergeRequestsResponse | Where-Object { $_.source_branch -eq $BranchName }
+
+                  if ($ExistingMR) {
+                      Write-Host "Merge Request já existe para o branch $BranchName"
+                  } else {
+                      # Criar o novo Merge Request
+                      $Body = @{
+                          id = $ProjectId
+                          source_branch = $BranchName
+                          target_branch = $TargetBranch
+                          remove_source_branch = $true
+                          title = "WIP: $BranchName"
+                          assignee_id = $env:GITLAB_USER_ID
+                      } | ConvertTo-Json -Depth 10
+
+                      $MergeRequestUri = "$env:GITLAB_API_URL/projects/$ProjectId/merge_requests"
+                      try {
+                          $response = Invoke-RestMethod -Uri $MergeRequestUri `
+                                                       -Method Post `
+                                                       -Headers $Headers `
+                                                       -Body $Body `
+                                                       -ContentType 'application/json'
+                          Write-Host "Merge Request criado com sucesso para o repositório $RepoName. ID do MR: $($response.id)"
+                      } catch {
+                          Write-Host "Erro ao criar Merge Request: $($_.Exception.Message)"
+                          Write-Host "Detalhes: $($_.Exception.Response)"
+                      }
+                  }
+              } else {
+                  Write-Host "Nenhuma dependência vulnerável encontrada para atualizar no repositório $RepoName."
+              }
+          } else {
+              Write-Host "Erro: Arquivo $DotnetOutdatedFile não foi gerado."
+          }
+          Set-Location -Path "..\.."
+      }
+  tags:
+    - DevOps-Runner
