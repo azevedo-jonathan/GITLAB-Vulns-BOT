@@ -72,7 +72,7 @@ analyze-and-update-all:
                   $BranchName = "update-dependencies/$CI_JOB_ID"
                   git checkout -b $BranchName
                   git add .
-                  git commit -m "pdate dependencies to fix vulnerabilities"
+                  git commit -m "update dependencies to fix vulnerabilities"
                   git push origin $BranchName
                   
                   # Obter o branch padrão do repositório
